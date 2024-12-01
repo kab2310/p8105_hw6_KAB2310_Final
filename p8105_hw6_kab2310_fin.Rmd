@@ -1,0 +1,288 @@
+---
+title: "HW 6"
+author: "Kamiah Brown"
+date: 2024-11-30
+output: github_document
+---
+### Set up 
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(p8105.datasets)
+library(broom)
+library(modelr)
+set.seed(123)
+```
+#### Problem 1
+```{r}
+weather_df = 
+  rnoaa::meteo_pull_monitors(
+    c("USW00094728"),
+    var = c("PRCP", "TMIN", "TMAX"), 
+    date_min = "2017-01-01",
+    date_max = "2017-12-31") %>%
+  mutate(
+    name = recode(id, USW00094728 = "CentralPark_NY"),
+    tmin = tmin / 10,
+    tmax = tmax / 10) %>%
+  select(name, id, everything())
+```
+
+# bootstrapping
+```{r}
+bootstraps <- weather_df |> 
+  modelr::bootstrap(5000) |> 
+  mutate(strap = map(strap, as_tibble), 
+         linear_model = map(strap, \(df) lm(tmax ~ tmin, data = df)), 
+    results = map(linear_model, broom::tidy), 
+    summary = map(linear_model, broom::glance))
+
+bootstrap_rsquared <- bootstraps |> 
+  unnest(summary) |> 
+  select(.id, `r.squared`) 
+
+bootstrap_logestimate <- bootstraps |> 
+  unnest(results) |> 
+  select(.id, estimate) |> 
+  group_by(`.id`) |> 
+  summarize(log_estimate = prod(estimate) |> log()) 
+
+boots_results <- bootstrap_rsquared |> 
+  inner_join(bootstrap_logestimate, by = ".id")
+```
+
+```{r}
+boots_results |> 
+ pivot_longer(
+    cols = 2:3, 
+    names_to = "type",
+    values_to = "estimate"
+  ) |> 
+  mutate(
+    labels = case_when(type == "log_estimate" ~ "log(hat(beta[0])*hat(beta[1]))", 
+                      type == "r.squared" ~ "r^2")) |> 
+  ggplot(aes(x = estimate, fill = type)) +
+  geom_density(alpha = 0.4) +
+  facet_wrap(~labels, scales = "free", 
+             ncol = 1, labeller = label_parsed) +
+  theme(legend.position = "none") +
+  labs(x = "Estimate", 
+       y = "Density", title = "Distribution of the Estimates")
+
+```
+The estimates of r squared and log_estimate are normally distributed. 
+```{r}
+boots_results |> 
+  summarize(
+    boot_mean = mean(r.squared),
+    boot_sd = sd(r.squared),
+    boot_variance = var(r.squared),
+    boot_ci_ll = quantile(r.squared, 0.025),
+    boot_ci_ul = quantile(r.squared, 0.975)
+  )
+```
+The 95% confidence interval for the r^2 is (0.894, 0.927).
+
+```{r}
+boots_results |>
+summarize(
+    boot_mean = mean(log_estimate),
+    boot_sd = sd(log_estimate),
+    boot_variance = var(log_estimate),
+    boot_ci_ll = quantile(log_estimate, 0.025),
+    boot_ci_ul = quantile(log_estimate, 0.975)
+  )
+```
+The 95% confidence interval for log estimate is (1.96, 2.06).
+
+#### Problem 2 
+```{r}
+homicide_df <- read_csv("homicide-data.csv") |>
+ mutate(
+    city_state = str_c(city, state, sep = ", "), 
+    solved = ifelse(str_detect(disposition, "Closed"), 1, 0)  #
+  ) %>%
+  filter(
+    !city_state %in% c("Dallas, TX", "Phoenix, AZ", "Kansas City, MO", "Tulsa, AL"),
+    victim_race %in% c("White", "Black"),
+    victim_age != "Unknown"
+  ) %>%
+  mutate(
+    victim_age = as.numeric(victim_age), 
+    victim_race = fct_relevel(victim_race, "White") 
+  )
+```
+####  city of Baltimore, MD
+```{r}
+baltimore_df = homicide_df |>
+  filter(city_state == "Baltimore, MD")
+
+baltimore_log = glm(
+solved ~ victim_age + victim_sex + victim_race, 
+  data = baltimore_df, 
+  family = binomial()
+)
+
+baltimore_results = broom::tidy(baltimore_log) |>
+  filter(term == "victim_sexMale") |>
+  mutate(
+    OR = exp(estimate), 
+    CI_lower = exp(estimate - 1.96 * std.error),  
+    CI_upper = exp(estimate + 1.96 * std.error) 
+  ) |>
+    select(OR, CI_lower, CI_upper)
+
+# Viewing
+baltimore_results
+
+# Display table
+baltimore_results |>
+  knitr::kable(digits = 4)
+```
+Compared to females, men have significantly lower odds of being convicted in homicides involving them, with an adjusted odds ratio of 0.3547 (95% CI: 0.2681–0.4691). A narrow confidence interval suggests reliable estimates, indicating a statistically significant result.
+
+#### glm for each cities
+```{r}
+cities_df = 
+  homicide_df |>
+  group_by(city_state) %>% 
+  nest() %>% 
+  mutate(
+    glm_fit = map(data, ~glm(solved ~ victim_age + victim_sex + victim_race, data = .x, family = binomial())),
+    tidy_results = map(glm_fit, ~broom::tidy(.x, conf.int = TRUE, exponentiate = TRUE))
+  ) %>% 
+  unnest(tidy_results) %>% 
+  filter(term == "victim_sexMale") %>%
+  select(city_state, estimate, conf.low, conf.high, p.value)
+
+```
+
+```{r}
+cities_df %>% 
+  arrange(estimate) %>% 
+  mutate(
+    city_state = factor(city_state, levels = city_state)) %>% 
+  ggplot(aes(x = city_state, y = estimate)) +
+  geom_point() +
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +
+  labs( title = "Esimated ORs and CIs for Solving Homocides by City", x = "City", y = "Male to Female Victims Odds Ratio") +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+  
+```
+Most cities have ORs near 1, indicating no significant difference in the odds of solving homicides between male and female victims. However, some cities, such as Fresno, CA, Minneapolis, MN, and Stockon, CA have ORs greater than 1, suggesting higher odds of solving homicides for male victims. Conversely, cities like Long Beach, CA, San Diego, and New York, NY have ORs less than 1, indicating higher odds of solving homicides for female victims. Wide confidence intervals in some cities reflect high uncertainty in the estimates.
+
+#### Problem 3
+```{r}
+birthweight = read_csv("birthweight.csv")
+```
+
+```{r}
+birthweight = 
+  birthweight |> 
+  mutate(
+    babysex = factor(babysex, levels = 1:2, labels = c("Male", "Female")),
+    frace = factor(frace, levels = c(1, 2, 3, 4, 8),
+                   labels = c("White", "Black", "Asian", "Puerto Rican", "Other")),
+    mrace = factor(mrace, levels = c(1, 2, 3, 4, 8),
+                   labels = c("White", "Black", "Asian", "Puerto Rican", "Other"))
+  )
+```
+
+```{r}
+model.full = lm(bwt ~ ., data = birthweight)
+model1 = step(model.full)
+```
+
+```{r}
+summary(model1)
+```
+
+####  Add prediction 
+
+```{r}
+addpredictions =
+  birthweight |> 
+  add_predictions(model1, var = "fitted_values") |> 
+  add_residuals(model1, var = "residuals")
+
+addpredictions |> 
+  ggplot(aes(x = fitted_values, y = residuals)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+  labs(
+    title = "Residuals vs Fitted Values",
+    x = "Fitted Values (Predicted Birthweight)",
+    y = "Residuals"
+  ) +
+  theme_minimal()
+```
+As indicated by the horizontal red dashed line, the residuals are mostly centered around zero, suggesting that the model captures the data fairly well. A few residuals, however, differ significantly from zero due to outliers.
+
+####  Compare your model to two others:
+length at birth and gestational age as predictors (main effects only)
+```{r}
+modela = lm(bwt ~ blength + gaweeks, data = birthweight)
+summary(modela)
+```
+
+head circumference, length, sex, and all interactions (including the three-way interaction) between these
+```{r}
+modelb = lm(bwt ~ bhead * blength * babysex, data = birthweight)
+summary(modelb)
+```
+
+```{r}
+set.seed(123)
+cv_df = crossv_mc(birthweight, 100) |> 
+  mutate(
+    train = map(train, as_tibble),
+    test = map(test, as_tibble)
+  ) |> 
+  mutate(
+    my_model = map(train, ~ lm(bwt ~ gaweeks + blength + babysex + wtgain, data = .x)),
+    model1_mod = map(train, ~ lm(bwt ~ blength + gaweeks, data = .x)),
+    model2_mod = map(train, ~ lm(
+      bwt ~ bhead + blength + babysex +
+        bhead * blength + blength * babysex + babysex * bhead +
+        bhead * blength * babysex, 
+      data = .x))
+  ) |> 
+  mutate(
+    rmse_my = map2_dbl(my_model, test, ~ rmse(model = .x, data = .y)),
+    rmse_model1 = map2_dbl(model1_mod, test, ~ rmse(model = .x, data = .y)),
+    rmse_model2 = map2_dbl(model2_mod, test, ~ rmse(model = .x, data = .y))
+  )
+```
+
+```{r}
+cv_summary = cv_df |> 
+  summarise(
+    mean_rmse_my = mean(rmse_my),
+    mean_rmse_model1 = mean(rmse_model1),
+    mean_rmse_model2 = mean(rmse_model2)
+  )
+```
+ The model 2 has the lowest RMSE (288.38), indicating that it provides the best predictive accuracy out of the three.
+
+```{r}
+cv_df |> 
+  select(starts_with("rmse")) |> 
+  pivot_longer(
+    everything(),
+    names_to = "model", 
+    values_to = "rmse",
+    names_prefix = "rmse_"
+  ) |> 
+  mutate(model = fct_inorder(model)) |> 
+  ggplot(aes(x = model, y = rmse)) +
+  geom_violin() +
+  labs(
+    title = "RMSE Distributions Across Models",
+    x = "Model",
+    y = "Root Mean Squared Error"
+  ) 
+```
+ According to the violin plot for Model 2, its median RMSE is lower than that of the other models, and its spread is narrower as well (less variability). Since the RMSE for Model 2 is the lowest and the performance is more consistent, it is the best fit and predictor, because it incorporates head circumference, length, sex, as well as their interactions.
